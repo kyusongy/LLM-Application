@@ -39,9 +39,10 @@ if __name__ == "__main__":
 
     result = sync_request_llm(
         llm_config=LLMConfig(
-            api_key="<api_key>",
-            base_url="<base_url>",
-            model="<model_name>"
+            api_key="tokenabc123",
+            base_url="http://127.0.0.1:12345/v1",
+            model="/data1/yaoys6/models/Qwen3-8B"
+            #vllm serve "/data1/yaoys6/models/Qwen3-8B" --port 12345 --dtype auto --api-key "tokenabc123" --enable-reasoning --reasoning-parser deepseek_r1
         ),
         messages=[
             {
