@@ -27,7 +27,7 @@ def sync_request_llm(
         temperature=generation_config.temperature,
         tools=tools,
         extra_body=generation_config.extra_body,
-        timeout=30,
+        timeout=generation_config.timeout,
         max_tokens=generation_config.max_tokens,
         top_p=generation_config.top_p,
         presence_penalty=generation_config.presence_penalty
@@ -55,7 +55,8 @@ if __name__ == "__main__":
             }
         ],
         generation_config=LLMGenerationOptions(
-            temperature=0.2
+            temperature=0.2,
+            timeout=120,
         )
     )
     rich.print(result)

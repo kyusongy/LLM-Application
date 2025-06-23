@@ -1,0 +1,443 @@
+from __future__ import annotations
+
+"""Blueprint generation & validation prototype.
+
+This module implements a minimal pipeline covering the *first* phase of
+APIGen-MT (task blueprint generation & validation).
+The goal is to demonstrate how the pieces fit together while re-using the
+existing LLM helper utilities already available in the repository.
+
+High-level flow
+---------------
+1. *BlueprintGenerator* – single LLM call that produces a blueprint JSON
+   (user intent + actions + expected outputs) based on the provided API
+   schema, business policies and a randomly chosen user persona.
+2. *BlueprintValidator* – light-weight, rule-based checks that make sure the
+   blueprint structure is sound and that every tool call can execute against
+   the API schema.  (No real DB/state changes are performed – we only do
+   static validation.)
+3. *ReviewCommittee* – a small committee of LLM reviews that rate the
+   blueprint on correctness/completeness/etc. Majority voting decides
+   pass/fail and produces feedback when it fails.
+4. *generate_valid_blueprint()* – orchestration helper that keeps iterating
+   (generate ➜ validate ➜ review ➜ feedback) until the blueprint passes or
+   the maximum number of attempts is reached.
+
+This is *only a prototype*: many aspects (e.g. policy engine, execution
+environment) are simplified or stubbed out – the focus is to provide a clear
+end-to-end skeleton you can extend.
+"""
+
+from dataclasses import dataclass
+import json
+import random
+import re
+import textwrap
+from typing import Any, Dict, List, Optional, Tuple
+
+from openai.types.chat import ChatCompletionMessageParam
+
+from common.llm import GenerationOptions as LLMGenerationOptions, LLMConfig
+from common.tool import ToolCalling
+from llm.sync_client import sync_request_llm
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Blueprint:
+    """Simple container for a task blueprint."""
+
+    user_intent: str
+    actions: List[ToolCalling]
+    expected_outputs: List[Any]
+    raw_response: str | None = None  # original LLM output for debugging
+
+
+# ---------------------------------------------------------------------------
+# Prompt helper
+# ---------------------------------------------------------------------------
+
+
+def _build_generator_prompt(
+    persona: str,
+    tools_schema: Dict[str, Any],
+    *,
+    task_rules: str = "",
+    domain_rules: str = "",
+    sampled_user_details: str = "",
+    sampled_orders: str = "",
+    examples: str = "",
+) -> List[ChatCompletionMessageParam]:
+    """Create **one** combined prompt string following Figure-8 of the paper.
+
+    This returns a single-item messages list (role="user") because the original
+    article shows the whole prompt as one block rather than split into system
+    / user messages.
+    """
+
+    prompt = textwrap.dedent(
+        f"""
+        ## Instructions
+        Generate a task instruction that mimics realistic human users and their intentions, such as with different personality and goals. The task instruction should be
+        followed by `actions` which is a list of the tool_calls to be taken to solve this task and `outputs` which is a list of the answers to specific information requests made
+        by the user. Think step by step to come up with the action(s) and the corresponding tool_call(s) translating this thought that would be necessary to fulfil the user's
+        request or solve their intentions. Focus on common retail scenarios following the provided task instruction guidelines.
+
+        ## Guidelines for Generating Task Instruction (q)
+        {task_rules + domain_rules}
+
+        ## User Data
+        {sampled_user_details}
+
+        ## Order Data
+        {sampled_orders}
+
+        ## Guidelines for generating Groundtruth Actions (a_g t)
+        1.  The main focus is to generate actions that can modify the underlying database.
+        2.  For actions that do not modify the database like specific information requests, scan the provided User Data directly and append only the answer in `outputs` (o_g t). Do not make separate tool calls for this in `actions`.
+        3.  Include multiple tool calls when the scenario requires multiple steps or modifications.
+        4.  Provide precise tool calls with all necessary parameters for each action.
+        5.  Ensure all actions adhere to retail policies and common sense practices.
+
+        ## Tools
+        The available tool combination in Python format is as follows:
+        {json.dumps(tools_schema, ensure_ascii=False, indent=2)}
+
+        ## Output Format
+        Generate your response according to the following format. Enclose the thought process within `<thought></thought>` tags, and the final structured response within
+        `<answer></answer>` tags. The structured response should be a single, strict JSON object with the following keys:
+        - "intent": A string describing the user's goal.
+        - "actions": A list of tool call objects. Each object must have "name" (string) and "arguments" (dictionary).
+        - "outputs": A list of final user-facing answers.
+
+        An example of the JSON structure to place inside the <answer> tags:
+        ```json
+        {{
+          "intent": "I want to order a laptop and then check on its status.",
+          "actions": [
+            {{
+              "name": "create_order",
+              "arguments": {{ "item": "laptop", "quantity": 1 }}
+            }},
+            {{
+              "name": "track_order",
+              "arguments": {{ "order_id": "ORD123456" }}
+            }}
+          ],
+          "outputs": [
+            "Your order for 1 laptop has been placed.",
+            "The order ORD123456 is currently being processed."
+          ]
+        }}
+        ```
+
+        ## Example Tasks
+        {examples}
+
+        Do not directly copy instruction and the action patterns from the examples. Ground the generation from the above provided data.
+        Generate the task now.
+        """
+    ).strip()
+
+    return [{"role": "user", "content": prompt}]
+
+
+# ---------------------------------------------------------------------------
+# Blueprint generator
+# ---------------------------------------------------------------------------
+
+
+class BlueprintGenerator:
+    """Generates a blueprint via a single LLM call."""
+
+    def __init__(self, llm_config: LLMConfig, gen_opts: Optional[LLMGenerationOptions] = None):
+        self.llm_config = llm_config
+        self.gen_opts = gen_opts or LLMGenerationOptions(temperature=1.0, max_tokens=1024)
+
+    def generate(
+        self,
+        persona: str,
+        tools_schema: Dict[str, Any],
+        **prompt_kwargs: Any,
+    ) -> Blueprint:
+        """Generate a blueprint. Additional template fields can be passed via kwargs."""
+
+        messages = _build_generator_prompt(
+            persona,
+            tools_schema,
+            task_rules=prompt_kwargs.get("task_rules", ""),
+            domain_rules=prompt_kwargs.get("domain_rules", ""),
+            sampled_user_details=prompt_kwargs.get("sampled_user_details", ""),
+            sampled_orders=prompt_kwargs.get("sampled_orders", ""),
+            examples=prompt_kwargs.get("examples", ""),
+        )
+        completion = sync_request_llm(
+            self.llm_config,
+            messages,
+            tools=None,
+            generation_config=self.gen_opts,
+        )
+        raw_content = completion.choices[0].message.content  # type: ignore[attr-defined]
+        if not isinstance(raw_content, str):
+            raise ValueError("Expected string content from LLM response")
+
+        # Extract content from <answer> tag, falling back to full response
+        match = re.search(r"<answer>(.*?)</answer>", raw_content, re.DOTALL)
+        if match:
+            json_content = match.group(1).strip()
+        else:
+            json_content = raw_content
+
+        # Parse JSON
+        try:
+            bp_dict = json.loads(json_content)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Blueprint is not valid JSON: {e}\nRaw: {json_content}") from e
+
+        intent = bp_dict.get("intent") or bp_dict.get("q") or ""
+        actions_raw: List[Dict[str, Any]] = bp_dict.get("actions", [])
+        outputs = bp_dict.get("outputs") or bp_dict.get("o_g_t") or []
+
+        actions: List[ToolCalling] = []
+        for a_raw in actions_raw:
+            tool_name = a_raw.get("name") or a_raw.get("tool_call")
+            tool_args = a_raw.get("arguments") or a_raw.get("parameters")
+            if tool_name and tool_args is not None:
+                actions.append(ToolCalling(name=tool_name, arguments=tool_args))
+
+        return Blueprint(intent, actions, outputs, raw_response=raw_content)
+
+
+# ---------------------------------------------------------------------------
+# Validator (format & static execution)
+# ---------------------------------------------------------------------------
+
+
+class BlueprintValidator:
+    """Performs simple structural & static execution checks."""
+
+    def __init__(self, tools_schema: Dict[str, Any]):
+        self.schema = tools_schema
+
+    # ---------- helpers ----------
+    def _check_action_against_schema(self, action: ToolCalling) -> Tuple[bool, str]:
+        if action.name not in self.schema:
+            return False, f"Unknown tool '{action.name}'"
+        spec = self.schema[action.name]
+        allowed_args = set(spec.get("parameters", {}).keys())
+        given_args = set((action.arguments or {}).keys())
+        unknown = given_args - allowed_args
+        if unknown:
+            return False, f"Unknown argument(s) {unknown} for tool '{action.name}'"
+        missing = {
+            k for k, v in spec.get("parameters", {}).items() if v.get("required", False) and k not in given_args
+        }
+        if missing:
+            return False, f"Missing required argument(s) {missing} for tool '{action.name}'"
+        return True, "OK"
+
+    # ---------- main API ----------
+    def validate(self, bp: Blueprint) -> Tuple[bool, List[str]]:
+        errors: List[str] = []
+        if not bp.user_intent:
+            errors.append("Empty intent")
+        if not bp.actions:
+            errors.append("No actions specified")
+        for idx, act in enumerate(bp.actions):
+            ok, msg = self._check_action_against_schema(act)
+            if not ok:
+                errors.append(f"Action #{idx}: {msg}")
+        return len(errors) == 0, errors
+
+
+# ---------------------------------------------------------------------------
+# Review committee (multi-LLM voting)
+# ---------------------------------------------------------------------------
+
+
+_REVIEW_SYSTEM = (
+    "You are an expert evaluator of task blueprints.  Assess the JSON object and rate the following dimensions on a 0-1 scale: correctness, completeness, "
+    "satisfaction, creativity.  Return a JSON *strictly* in the form {\"correctness\":0/1,...,\"total\":0-4,\"correction\":<text>} ."
+)
+
+
+class ReviewCommittee:
+    """Queries multiple judge LLMs and uses majority voting."""
+
+    def __init__(
+        self,
+        llm_config: LLMConfig,
+        size: int = 3,
+        pass_threshold: float = 3.0,
+        gen_opts: Optional[LLMGenerationOptions] = None,
+    ):
+        self.cfg = llm_config
+        self.size = size
+        self.pass_threshold = pass_threshold
+        self.gen_opts = gen_opts or LLMGenerationOptions(temperature=0, timeout=60)
+
+    def _build_messages(self, bp: Blueprint) -> List[ChatCompletionMessageParam]:
+        body = json.dumps(
+            {
+                "intent": bp.user_intent,
+                "actions": [a.model_dump() for a in bp.actions],
+                "outputs": bp.expected_outputs,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        return [
+            {"role": "system", "content": _REVIEW_SYSTEM},
+            {"role": "user", "content": body},
+        ]
+
+    def review(self, bp: Blueprint) -> Tuple[bool, List[Dict[str, Any]]]:
+        messages = self._build_messages(bp)
+        votes: List[Dict[str, Any]] = []
+        passes = 0
+        for _ in range(self.size):
+            comp = sync_request_llm(self.cfg, messages, generation_config=self.gen_opts)
+            reply = comp.choices[0].message.content  # type: ignore[attr-defined]
+            try:
+                data = json.loads(reply)
+            except json.JSONDecodeError:
+                data = {"total": 0, "correction": "Malformed judge output"}
+            votes.append(data)
+            if data.get("total", 0) >= self.pass_threshold:
+                passes += 1
+        majority_pass = passes > self.size // 2
+        return majority_pass, votes
+
+
+# ---------------------------------------------------------------------------
+# Orchestration helper
+# ---------------------------------------------------------------------------
+
+
+def generate_valid_blueprint(
+    llm_cfg: LLMConfig,
+    tools_schema: Dict[str, Any],
+    personas: List[str],
+    max_attempts: int = 5,
+    prompt_kwargs: Optional[Dict[str, Any]] = None,
+) -> Blueprint:
+    """Generate-validate-review loop until a blueprint is accepted or we give up."""
+
+    # High-creativity settings for the generator
+    generator_opts = LLMGenerationOptions(temperature=1.0, max_tokens=2048, timeout=120)
+    # Low-creativity, deterministic settings for the judge
+    committee_opts = LLMGenerationOptions(temperature=0.0, max_tokens=2048, timeout=120)
+
+    generator = BlueprintGenerator(llm_cfg, gen_opts=generator_opts)
+    validator = BlueprintValidator(tools_schema)
+    committee = ReviewCommittee(llm_cfg, gen_opts=committee_opts)
+
+    for attempt in range(1, max_attempts + 1):
+        persona = random.choice(personas)
+        try:
+            bp = generator.generate(persona, tools_schema, **(prompt_kwargs or {}))
+        except ValueError as e:
+            print(f"[Attempt {attempt}] ❌ Generation failed: {e}")
+            continue
+
+        ok_struct, errs = validator.validate(bp)
+        if not ok_struct:
+            print(f"[Attempt {attempt}] ❌ Validation failed: {errs}")
+            continue
+
+        ok_review, votes = committee.review(bp)
+        if ok_review:
+            print(f"[Attempt {attempt}] ✅ Blueprint accepted")
+            return bp
+        print(f"[Attempt {attempt}] ❌ Committee rejected. Feedback: {[v.get('correction') for v in votes]}")
+
+    raise RuntimeError(f"Failed to generate a valid blueprint after {max_attempts} attempts")
+
+
+# ---------------------------------------------------------------------------
+# Demo (run `python -m blueprint.pipeline` if desired)
+# ---------------------------------------------------------------------------
+
+
+if __name__ == "__main__":
+    # LLM endpoint, configured for the vLLM server.
+    dummy_cfg = LLMConfig(
+        base_url="http://127.0.0.1:12345/v1",
+        model="/data1/yaoys6/models/Qwen3-8B",
+        api_key="tokenabc123",
+    )
+
+    dummy_schema = {
+        "create_order": {
+            "description": "Create a new order",
+            "parameters": {
+                "item": {"type": "string", "required": True},
+                "quantity": {"type": "integer", "required": True},
+            },
+        },
+        "track_order": {
+            "description": "Track order status",
+            "parameters": {
+                "order_id": {"type": "string", "required": True},
+            },
+        },
+    }
+
+    personas_sample = ["Casual shopper Alice", "Business client Bob"]
+    domain_rules_text = "Orders with quantity > 5 are not allowed. No cancellations for digital goods."
+    user_details_text = """
+- User ID: U123, Name: Alice, History: Has previously purchased books and electronics.
+"""
+    orders_text = """
+- Order ID: ORD456, Item: "The Great Gatsby" book, Status: Delivered
+- Order ID: ORD789, Item: Headphones, Status: Shipped
+"""
+
+    # Example to guide the model's output (few-shot prompting)
+    example_string = """
+<thought>
+The user, a casual shopper, wants to buy two of the same item. I need to call the `create_order` tool. The policies state the maximum quantity is 5, and 2 is within this limit. The output should confirm the order creation.
+</thought>
+<answer>
+{
+  "intent": "I need to get two of those things for my kids.",
+  "actions": [
+    {
+      "name": "create_order",
+      "arguments": {
+        "item": "board game",
+        "quantity": 2
+      }
+    }
+  ],
+  "outputs": [
+    "Your order for 2 board games has been placed."
+  ]
+}
+</answer>
+"""
+
+    # Run the blueprint generation pipeline.
+    bp = generate_valid_blueprint(
+        dummy_cfg,
+        dummy_schema,
+        personas_sample,
+        prompt_kwargs={
+            "examples": example_string,
+            "domain_rules": domain_rules_text,
+            "sampled_user_details": user_details_text,
+            "sampled_orders": orders_text,
+        },
+    )
+
+    # Convert the final blueprint to a printable dictionary before dumping to JSON
+    printable_blueprint = {
+        "user_intent": bp.user_intent,
+        "actions": [action.model_dump() for action in bp.actions],
+        "expected_outputs": bp.expected_outputs,
+        "raw_response": bp.raw_response,
+    }
+    print(json.dumps(printable_blueprint, indent=2, ensure_ascii=False)) 

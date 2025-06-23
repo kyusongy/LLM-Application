@@ -23,6 +23,11 @@ class GenerationOptions(BaseModel):
     presence_penalty: Optional[float] = None
     top_p: Optional[int] = None
     extra_body: Optional[Dict] = None
+    timeout: int = Field(
+        title="请求超时时间",
+        description="请求LLM服务的超时时间（秒）",
+        default=60,
+    )
 
 
 class LLMConfig(BaseModel):
