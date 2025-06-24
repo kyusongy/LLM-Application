@@ -28,6 +28,7 @@ class GenerationOptions(BaseModel):
         description="请求LLM服务的超时时间（秒）",
         default=60,
     )
+    debug: bool = False  # if True, prints raw LLM replies for debugging
 
 
 class LLMConfig(BaseModel):

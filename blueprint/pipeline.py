@@ -146,6 +146,36 @@ def _build_generator_prompt(
 
 
 # ---------------------------------------------------------------------------
+# Helper to robustly extract JSON from LLM outputs
+# ---------------------------------------------------------------------------
+
+
+def _extract_json_block(text: str) -> str:
+    """Return a clean JSON string by stripping <answer>/<scores> tags and ``` fences."""
+    cleaned = text.strip()
+
+    # 1) Remove complete <tag>...</tag> blocks (handles well-formed tags)
+    for tag in ("answer", "scores"):
+        m = re.search(fr"<\s*{tag}\s*>(.*?)<\s*/{tag}\s*>", cleaned, re.S | re.I)
+        if m:
+            cleaned = m.group(1).strip()
+
+    # 2) Remove any stray opening / closing tags left behind (for cases where the LLM forgets the closing tag).
+    cleaned = re.sub(r"<\s*/?\s*(answer|scores)\s*>", "", cleaned, flags=re.I)
+
+    # 3) Remove leading / trailing fenced code blocks.
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.I)
+
+    # 4) Heuristically grab the first JSON object if extraneous text remains.
+    brace_match = re.search(r"\{.*\}", cleaned, re.S)
+    if brace_match:
+        cleaned = brace_match.group(0)
+
+    return cleaned.strip()
+
+
+# ---------------------------------------------------------------------------
 # Blueprint generator
 # ---------------------------------------------------------------------------
 
@@ -181,15 +211,13 @@ class BlueprintGenerator:
             generation_config=self.gen_opts,
         )
         raw_content = completion.choices[0].message.content  # type: ignore[attr-defined]
+        if self.gen_opts.debug:
+            print("\n----- Generator raw output -----\n", raw_content, "\n-------------------------------\n")
         if not isinstance(raw_content, str):
             raise ValueError("Expected string content from LLM response")
 
         # Extract content from <answer> tag, falling back to full response
-        match = re.search(r"<answer>(.*?)</answer>", raw_content, re.DOTALL)
-        if match:
-            json_content = match.group(1).strip()
-        else:
-            json_content = raw_content
+        json_content = _extract_json_block(raw_content)
 
         # Parse JSON
         try:
@@ -208,7 +236,7 @@ class BlueprintGenerator:
             if tool_name and tool_args is not None:
                 actions.append(ToolCalling(name=tool_name, arguments=tool_args))
 
-        return Blueprint(intent, actions, outputs, raw_response=raw_content)
+        return Blueprint(intent, actions, outputs, raw_response=json_content)
 
 
 # ---------------------------------------------------------------------------
@@ -254,14 +282,48 @@ class BlueprintValidator:
 
 
 # ---------------------------------------------------------------------------
-# Review committee (multi-LLM voting)
+# Review Committee
 # ---------------------------------------------------------------------------
 
 
-_REVIEW_SYSTEM = (
-    "You are an expert evaluator of task blueprints.  Assess the JSON object and rate the following dimensions on a 0-1 scale: correctness, completeness, "
-    "satisfaction, creativity.  Return a JSON *strictly* in the form {\"correctness\":0/1,...,\"total\":0-4,\"correction\":<text>} ."
-)
+_REVIEW_PROMPT_TEMPLATE = """
+You are an AI judge and your goal is to judge the quality and validity of the provided task object based on the guidelines, following the rubric.
+
+## Guidelines
+• The task object contains an `intent` (q) from a user, `actions` (a_g t), and `outputs` (o_g t).
+• The `actions` correspond to the tool_calls made by an AI assistant to satisfy the instruction.
+• A description of the `tools` available to the AI assistant is provided.
+• The `diff_patch` is the difference in the database state after the tool_calls are made. It should only reflect changes corresponding to the `intent`. There should be no extraneous changes. If the `diff_patch` is empty, it means that the tool_calls did not change the database state, which is possible if the instruction was to provide information only.
+• Perform a brief reflection on the task based on the below Rubrics.
+• Think step-by-step to generate a score of 0 or 1 for each of these criteria (1 means follows criterion and 0 means does not)
+
+## Rubric
+• Correctness: Do the actions (a_g t) accurately implement the instruction (q)?
+• Completeness: Is the instruction (q) sufficiently detailed, and is it fully addressed by the actions? (Includes rule-based checks).
+• Satisfaction: Do the expected outputs (o_g t) fulfil any explicit or implicit information requests within the instruction (q)?
+• Creativity: Does the task represent a non-trivial, plausible, and potentially interesting scenario within the domain?
+
+## Task Object
+{task}
+
+## Tools in Python format
+{tools}
+
+## Diff Patch
+{diff_patch}
+
+## Output format
+<scores>
+{{
+    "reflection": str,
+    "correctness": int,  # 0/1
+    "completeness": int, # 0/1
+    "satisfaction": int, # 0/1
+    "creativity": int,   # 0/1
+    "total": int,        # 0-4
+    "correction": str
+}}
+""".strip()
 
 
 class ReviewCommittee:
@@ -273,14 +335,16 @@ class ReviewCommittee:
         size: int = 3,
         pass_threshold: float = 3.0,
         gen_opts: Optional[LLMGenerationOptions] = None,
+        tools_schema: Optional[Dict[str, Any]] = None,
     ):
         self.cfg = llm_config
         self.size = size
         self.pass_threshold = pass_threshold
         self.gen_opts = gen_opts or LLMGenerationOptions(temperature=0, timeout=60)
+        self.tools_schema = tools_schema or {}
 
     def _build_messages(self, bp: Blueprint) -> List[ChatCompletionMessageParam]:
-        body = json.dumps(
+        task_json = json.dumps(
             {
                 "intent": bp.user_intent,
                 "actions": [a.model_dump() for a in bp.actions],
@@ -289,10 +353,13 @@ class ReviewCommittee:
             ensure_ascii=False,
             indent=2,
         )
-        return [
-            {"role": "system", "content": _REVIEW_SYSTEM},
-            {"role": "user", "content": body},
-        ]
+        tools_json = json.dumps(self.tools_schema, ensure_ascii=False, indent=2)
+        prompt = _REVIEW_PROMPT_TEMPLATE.format(
+            task=task_json,
+            tools=tools_json,
+            diff_patch="",  # placeholder – no environment diff in prototype
+        )
+        return [{"role": "user", "content": prompt}]
 
     def review(self, bp: Blueprint) -> Tuple[bool, List[Dict[str, Any]]]:
         messages = self._build_messages(bp)
@@ -300,9 +367,12 @@ class ReviewCommittee:
         passes = 0
         for _ in range(self.size):
             comp = sync_request_llm(self.cfg, messages, generation_config=self.gen_opts)
-            reply = comp.choices[0].message.content  # type: ignore[attr-defined]
+            raw = comp.choices[0].message.content  # type: ignore[attr-defined]
+            reply = raw if isinstance(raw, str) else ""
+            if self.gen_opts.debug:
+                print("\n----- Judge raw reply -----\n", reply, "\n---------------------------\n")
             try:
-                data = json.loads(reply)
+                data = json.loads(_extract_json_block(reply)) if reply.strip() else {"total": 0}
             except json.JSONDecodeError:
                 data = {"total": 0, "correction": "Malformed judge output"}
             votes.append(data)
@@ -327,13 +397,13 @@ def generate_valid_blueprint(
     """Generate-validate-review loop until a blueprint is accepted or we give up."""
 
     # High-creativity settings for the generator
-    generator_opts = LLMGenerationOptions(temperature=1.0, max_tokens=2048, timeout=120)
+    generator_opts = LLMGenerationOptions(temperature=1.0, max_tokens=2048, timeout=120, debug=True)
     # Low-creativity, deterministic settings for the judge
-    committee_opts = LLMGenerationOptions(temperature=0.0, max_tokens=2048, timeout=120)
+    committee_opts = LLMGenerationOptions(temperature=0.0, max_tokens=2048, timeout=120, debug=True)
 
     generator = BlueprintGenerator(llm_cfg, gen_opts=generator_opts)
     validator = BlueprintValidator(tools_schema)
-    committee = ReviewCommittee(llm_cfg, gen_opts=committee_opts)
+    committee = ReviewCommittee(llm_cfg, gen_opts=committee_opts, tools_schema=tools_schema)
 
     for attempt in range(1, max_attempts + 1):
         persona = random.choice(personas)
@@ -366,7 +436,7 @@ if __name__ == "__main__":
     # LLM endpoint, configured for the vLLM server.
     dummy_cfg = LLMConfig(
         base_url="http://127.0.0.1:12345/v1",
-        model="/data1/yaoys6/models/Qwen3-8B",
+        model="/data1/yaoys6/models/Qwen3-32B",
         api_key="tokenabc123",
     )
 
