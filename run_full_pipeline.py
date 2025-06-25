@@ -27,41 +27,100 @@ CFG = LLMConfig(
 )
 
 # ---------------------------------------------------------------------------
-# 1.  SAMPLE TOOL SCHEMA & PLACEHOLDER DOMAIN INFO
+# 0.  DOMAIN-SPECIFIC DUMMY TOOLS & DATA
 # ---------------------------------------------------------------------------
-API_SCHEMA = {
-    "create_order": {
-        "description": "Create a new order",
-        "parameters": {
-            "item": {"type": "string", "required": True},
-            "quantity": {"type": "integer", "required": True},
-        },
-    },
-    "track_order": {
-        "description": "Track order status",
-        "parameters": {"order_id": {"type": "string", "required": True}},
-    },
-}
-PERSONAS = [
-    "Casual shopper Alice",
-    "Business client Bob",
-]
-DOMAIN_RULES = (
-    "Orders with quantity > 5 are not allowed. No cancellations for digital goods."
-)
+
+from dummy_tools import TOOLS_SCHEMA  # noqa: E402 – after sys.path is set
 
 # ---------------------------------------------------------------------------
-# 2.  GENERATE & VALIDATE ONE BLUEPRINT  (Phase-1)
+# 1.  TOOL SCHEMA  (imported from dummy_tools)
 # ---------------------------------------------------------------------------
+API_SCHEMA = TOOLS_SCHEMA
+
+# ---------------------------------------------------------------------------
+# 2.  SIMPLE BUSINESS POLICY & PERSONAS
+# ---------------------------------------------------------------------------
+
+DOMAIN_RULES = "Delivered orders cannot be canceled. Exchanges only allowed within 30 days."
+
+PERSONAS = [
+    "Budget-conscious student Emma",  # prefers deals, concise questions
+    "Detail-oriented engineer Yusuf",  # wants everything in one go
+    "Busy parent Carla",               # cares about speed and convenience
+]
+
+# Dummy user & order snapshots – used as prompt context for the blueprint LLM
+SAMPLED_USER_DETAILS = """
+- User ID: user_YRos_19122, Name: Yusuf Rossi, ZIP: 19122, History: Bought peripherals & smart devices.
+- User ID: user_EClar_27513, Name: Emma Clark, ZIP: 27513, History: Bought textbooks & earbuds.
+"""
+
+SAMPLED_ORDERS = """
+- Order ID: #W2378156, Status: Delivered, Items: [keyboard-id 1151293680, thermostat-id 4983901480]
+- Order ID: #X9934712, Status: Shipped,   Items: [earbuds-id 3311224488]
+"""
+
+# ---------------------------------------------------------------------------
+# 3.  EXAMPLE BLUEPRINT (few-shot) — mirrors τ-bench structure
+# ---------------------------------------------------------------------------
+
+EXAMPLE_TASK = """
+<thought>
+The user has received order #W2378156 (keyboard & thermostat) and wants to
+exchange both items for alternatives that better match their preferences.
+To fulfil this we must:
+  1) `find_user_id_by_name_zip` to get internal user ID;
+  2) `get_order_details` to verify delivery status;
+  3-4) `get_product_details` for each desired replacement item;
+  5) `exchange_delivered_order_items` with correct mappings.
+</thought>
+<answer>
+{
+  "intent": "You are Yusuf Rossi in 19122. You received your order #W2378156 and wish to exchange the mechanical keyboard for a similar one but with clicky switches and the smart thermostat for one compatible with Google Home instead of Apple HomeKit. If there is no keyboard that is clicky, RGB backlight, full size, you'd go for no backlight. You are detail-oriented and want to make sure everything is addressed in one go.",
+  "actions": [
+    {
+      "name": "get_order_details",
+      "arguments": {"order_id": "#W2378156"}
+    },
+    {
+      "name": "get_product_details",
+      "arguments": {"product_id": "7706410293"}
+    },
+    {
+      "name": "get_product_details",
+      "arguments": {"product_id": "7747408585"}
+    },
+    {
+      "name": "exchange_delivered_order_items",
+      "arguments": {
+        "order_id": "#W2378156",
+        "item_ids": ["1151293680", "4983901480"],
+        "new_item_ids": ["7706410293", "7747408585"],
+        "payment_method_id": "credit_card_9513926"
+      }
+    }
+  ],
+  "outputs": [
+    "Your exchange order is being processed."
+  ]
+}
+</answer>
+"""
+
+# ---------------------------------------------------------------------------
+# 4.  GENERATE BLUEPRINT (Phase-1)
+# ---------------------------------------------------------------------------
+
 blueprint = generate_valid_blueprint(
     CFG,
     API_SCHEMA,
     PERSONAS,
     prompt_kwargs={
         "domain_rules": DOMAIN_RULES,
-        "sampled_user_details": "- User ID: U123, Name: Alice, History: Bought books",
-        "sampled_orders": "- Order ID: ORD789, Item: Headphones, Status: Shipped",
-        "examples": "",  # optional few-shot example
+        "sampled_user_details": SAMPLED_USER_DETAILS,
+        "sampled_orders": SAMPLED_ORDERS,
+        "examples": EXAMPLE_TASK,
+        "task_rules": "Delivered orders cannot be canceled.",
     },
 )
 
@@ -79,7 +138,7 @@ print(
 )
 
 # ---------------------------------------------------------------------------
-# 3.  COLLECT TRAJECTORY  (Phase-2)
+# 5.  COLLECT TRAJECTORY  (Phase-2)
 # ---------------------------------------------------------------------------
 collector = TrajectoryCollector(CFG, CFG, tools_schema=API_SCHEMA, debug=True)
 trajectory = collector.collect(blueprint)

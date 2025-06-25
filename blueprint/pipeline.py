@@ -70,6 +70,7 @@ def _build_generator_prompt(
     sampled_user_details: str = "",
     sampled_orders: str = "",
     examples: str = "",
+    prev_feedback: str = "",
 ) -> List[ChatCompletionMessageParam]:
     """Create **one** combined prompt string following Figure-8 of the paper.
 
@@ -88,6 +89,12 @@ def _build_generator_prompt(
 
         ## Guidelines for Generating Task Instruction (q)
         {task_rules + domain_rules}
+
+        ## VERY IMPORTANT: The instruction (intent) MUST explicitly mention
+        *every* concrete identifier or value that the assistant will need
+        later, such as order_id, user_id, item names, quantities, dates,
+        etc.  This allows a simulated human to converse naturally WITHOUT
+        hallucinating any missing details.
 
         ## User Data
         {sampled_user_details}
@@ -108,34 +115,14 @@ def _build_generator_prompt(
 
         ## Output Format
         Generate your response according to the following format. Enclose the thought process within `<thought></thought>` tags, and the final structured response within
-        `<answer></answer>` tags. The structured response should be a single, strict JSON object with the following keys:
-        - "intent": A string describing the user's goal.
-        - "actions": A list of tool call objects. Each object must have "name" (string) and "arguments" (dictionary).
-        - "outputs": A list of final user-facing answers.
+        `<answer></answer>` tags. The structured response should be in strict JSON format, without any additional comments or explanations.
 
-        An example of the JSON structure to place inside the <answer> tags:
-        ```json
-        {{
-          "intent": "I want to order a laptop and then check on its status.",
-          "actions": [
-            {{
-              "name": "create_order",
-              "arguments": {{ "item": "laptop", "quantity": 1 }}
-            }},
-            {{
-              "name": "track_order",
-              "arguments": {{ "order_id": "ORD123456" }}
-            }}
-          ],
-          "outputs": [
-            "Your order for 1 laptop has been placed.",
-            "The order ORD123456 is currently being processed."
-          ]
-        }}
-        ```
 
         ## Example Tasks
         {examples}
+
+        ## Feedback from previous attempt
+        {prev_feedback}
 
         Do not directly copy instruction and the action patterns from the examples. Ground the generation from the above provided data.
         Generate the task now.
@@ -203,6 +190,7 @@ class BlueprintGenerator:
             sampled_user_details=prompt_kwargs.get("sampled_user_details", ""),
             sampled_orders=prompt_kwargs.get("sampled_orders", ""),
             examples=prompt_kwargs.get("examples", ""),
+            prev_feedback=prompt_kwargs.get("prev_feedback", ""),
         )
         completion = sync_request_llm(
             self.llm_config,
@@ -405,26 +393,42 @@ def generate_valid_blueprint(
     validator = BlueprintValidator(tools_schema)
     committee = ReviewCommittee(llm_cfg, gen_opts=committee_opts, tools_schema=tools_schema)
 
+    prev_feedback = ""  # aggregated feedback from validator & committee
+
     for attempt in range(1, max_attempts + 1):
         persona = random.choice(personas)
         try:
-            bp = generator.generate(persona, tools_schema, **(prompt_kwargs or {}))
+            bp = generator.generate(
+                persona,
+                tools_schema,
+                **{**(prompt_kwargs or {}), "prev_feedback": prev_feedback},
+            )
         except ValueError as e:
             print(f"[Attempt {attempt}] ❌ Generation failed: {e}")
+            # pass the error message as feedback to nudge next attempt
+            prev_feedback = str(e)
             continue
 
         ok_struct, errs = validator.validate(bp)
         if not ok_struct:
             print(f"[Attempt {attempt}] ❌ Validation failed: {errs}")
+            # join validation errors as feedback
+            prev_feedback = "; ".join(errs)
             continue
 
         ok_review, votes = committee.review(bp)
         if ok_review:
             print(f"[Attempt {attempt}] ✅ Blueprint accepted")
             return bp
-        print(f"[Attempt {attempt}] ❌ Committee rejected. Feedback: {[v.get('correction') for v in votes]}")
 
-    raise RuntimeError(f"Failed to generate a valid blueprint after {max_attempts} attempts")
+        # collect corrections from committee votes for next round
+        corrections = [v.get("correction", "") for v in votes if v.get("correction")]
+        prev_feedback = " | ".join(corrections)
+        print(f"[Attempt {attempt}] ❌ Committee rejected. Feedback: {prev_feedback}")
+
+    raise RuntimeError(
+        f"Failed to generate a valid blueprint after {max_attempts} attempts. Last feedback: {prev_feedback}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -469,22 +473,27 @@ if __name__ == "__main__":
     # Example to guide the model's output (few-shot prompting)
     example_string = """
 <thought>
-The user, a casual shopper, wants to buy two of the same item. I need to call the `create_order` tool. The policies state the maximum quantity is 5, and 2 is within this limit. The output should confirm the order creation.
+The user has a shipped headphones order with ID ORD789 and now wants to check
+its status before buying two more books.  To satisfy the request we must first
+call `track_order` using the known order_id, then call `create_order` for the
+two books.  The outputs confirm both actions.
 </thought>
 <answer>
 {
-  "intent": "I need to get two of those things for my kids.",
+  "intent": "Please track my headphones order 09223 and help me buy 2 copies of 'The Pragmatic Programmer'.",
   "actions": [
     {
+      "name": "track_order",
+      "arguments": { "order_id": "09223" }
+    },
+    {
       "name": "create_order",
-      "arguments": {
-        "item": "board game",
-        "quantity": 2
-      }
+      "arguments": { "item": "The Pragmatic Programmer", "quantity": 2 }
     }
   ],
   "outputs": [
-    "Your order for 2 board games has been placed."
+    "Your headphones order ORD789 is currently Shipped.",
+    "Your order for 2 'The Pragmatic Programmer' has been placed."
   ]
 }
 </answer>

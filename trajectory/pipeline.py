@@ -19,7 +19,12 @@ from common.llm import LLMConfig, GenerationOptions as LLMGenOpts
 from common.tool import ToolCalling
 from llm.sync_client import sync_request_llm
 from blueprint.pipeline import Blueprint  # reuse dataclass from phase-1
-from openai import BadRequestError
+
+# ---------------- Qwen-Agent integration -----------------
+# pylint: disable=import-error
+from qwen_agent.agents import Assistant  # type: ignore
+# Ensure tool wrappers are registered before Assistant is instantiated
+import qwen_tool_wrappers  # noqa: F401  # registers tools via import side-effects
 
 # ---------------------------------------------------------------------------
 # Prompts (verbatim from paper – Fig.11 & Fig.12)
@@ -38,6 +43,7 @@ _TRAJECTORY_COLLECTION_PROMPT_TEMPLATE = textwrap.dedent(
     • Do not hallucinate information that is not provided in the intent.
     • If the intent goal is satisfied, generate `###STOP###` to end the conversation.
     • Do not repeat the exact intent in the conversation. Instead, use your own words to convey the same information.
+    • Do not copy or repeat any assistant messages. Always write a brand-new user turn in your own words.
     • Try to make the conversation as natural as possible and stick to the personalities in the intent.
 
     ### Response format
@@ -91,22 +97,26 @@ class Trajectory:
 class SimulatedHuman:
     """LLM that reveals the intent gradually using BoN self-critique."""
 
-    def __init__(self, llm_cfg: LLMConfig, bon_n: int = 2):
+    def __init__(self, llm_cfg: LLMConfig, bon_n: int = 1, debug: bool = False):
         self.cfg = llm_cfg
         self.bon_n = bon_n
+        self.debug = debug
         self._primed = False  # ensure giant prompt is sent only once
+
         # Lower temperature & token budget for faster, more focused replies during prototyping
         self.agent_opts = LLMGenOpts(
             temperature=0.3,
-            max_tokens=64,
-            timeout=60,
-            extra_body={"enable_reasoning": False},
+            max_tokens=2048,
+            timeout=120,
+            extra_body={"enable_reasoning": True},
+            debug=debug,
         )
         self.judge_opts = LLMGenOpts(
             temperature=0.0,
-            max_tokens=32,
+            max_tokens=256,
             timeout=30,
-            extra_body={"enable_reasoning": False},
+            extra_body={"enable_reasoning": True},
+            debug=debug,
         )
 
     def _score_candidate(self, description: str, candidate: str) -> int:
@@ -119,22 +129,44 @@ class SimulatedHuman:
 
     def next_message(self, intent: str, history: List[Turn]) -> str:
         """Generate the next user message via Best-of-N sampling."""
+        # Insert the persona prompt only on the very first turn and keep it in
+        # the running history thereafter (mirrors TestAgent behaviour).
         if not self._primed:
-            # First turn: send the giant prompt as a *user* message, no prior history
-            messages = [{"role": "user", "content": _TRAJECTORY_COLLECTION_PROMPT_TEMPLATE.format(intent=intent)}]
+            self._persona_prompt = _TRAJECTORY_COLLECTION_PROMPT_TEMPLATE.format(intent=intent)
+            # Prepend as a system turn so future calls include it automatically
+            history.insert(0, Turn("system", self._persona_prompt))
             self._primed = True
-        else:
-            messages = [{"role": t.role, "content": t.content} for t in history]
+
+        # Convert the (now complete) history—including the system prompt—into
+        # the OpenAI chat format.
+        messages = [{"role": t.role, "content": t.content} for t in history]
 
         candidates: List[Tuple[str, int]] = []
-        for _ in range(self.bon_n):
+        if self.bon_n <= 1:
             comp = sync_request_llm(self.cfg, messages, generation_config=self.agent_opts)
+
+            if self.debug:
+                m = comp.choices[0].message
+                print("[DEBUG/HUMAN] content:", repr(getattr(m, "content", "")))
+                print("[DEBUG/HUMAN] reasoning_content:", repr(getattr(m, "reasoning_content", "")))
+
             raw = _get_msg_content(comp.choices[0].message)  # type: ignore[attr-defined]
-            msg = raw if isinstance(raw, str) else ""
-            score = self._score_candidate(intent, msg) if msg else 0
-            candidates.append((msg, score))
-        # choose best non-empty candidate
-        best_msg = max(candidates, key=lambda x: x[1])[0]
+            best_msg = raw if isinstance(raw, str) else ""
+        else:
+            for _ in range(self.bon_n):
+                comp = sync_request_llm(self.cfg, messages, generation_config=self.agent_opts)
+
+                if self.debug:
+                    m = comp.choices[0].message
+                    print("[DEBUG/HUMAN] content:", repr(getattr(m, "content", "")))
+                    print("[DEBUG/HUMAN] reasoning_content:", repr(getattr(m, "reasoning_content", "")))
+
+                raw = _get_msg_content(comp.choices[0].message)  # type: ignore[attr-defined]
+                msg = raw if isinstance(raw, str) else ""
+                score = self._score_candidate(intent, msg) if msg else 0
+                candidates.append((msg, score))
+            # choose best non-empty candidate
+            best_msg = max(candidates, key=lambda x: x[1])[0]
 
         # Post-process to strip meta reflections like "Okay, the user wants …".
         if not best_msg:
@@ -156,60 +188,29 @@ class SimulatedHuman:
         return best_msg.strip()
 
 
-class TestAgent:
-    """LLM in function-calling mode that tries to satisfy the task."""
+class QwenTestAgent:
+    """Wrap Qwen-Agent's `Assistant` for our trajectory collector."""
 
     def __init__(self, llm_cfg: LLMConfig):
-        self.cfg = llm_cfg
-        self.opts = LLMGenOpts(
-            temperature=0.3,
-            max_tokens=512,
-            timeout=240,
-            extra_body={"enable_reasoning": False},
-        )
-        self._primed = False
+        # Import registry after wrappers have been imported so tools are present.
+        import dummy_tools as _d
 
-        self._assistant_prompt = (
-            "You are an AI assistant that MUST satisfy the user's request **only** by calling one of the provided tools when required. "
-            "Use the exact function name as listed; do NOT invent new names. "
-            "Respond either with a JSON function call or, if no tool is needed, with a brief natural-language answer."
+        self.bot = Assistant(
+            llm={
+                "model": llm_cfg.model,
+                "model_server": llm_cfg.base_url,
+                "api_key": llm_cfg.api_key,
+            },
+            function_list=list(_d.TOOLS_SCHEMA.keys()),  # expose only dummy tools to avoid heavy deps
         )
 
-    def respond(
-        self,
-        history: List[Dict],
-        tools: Optional[List[dict]] = None,
-    ) -> Tuple[str, Optional[ToolCalling]]:
-        """Query the LLM and optionally enable OpenAI function-calling with the given tools."""
+    def respond(self, history: List[dict]) -> list[dict]:
+        """Return the list of new messages generated by the agent for the current turn."""
 
-        # Prime once with assistant prompt as a system message
-        if not self._primed:
-            history = [{"role": "system", "content": self._assistant_prompt}] + history
-            self._primed = True
-
-        try:
-            comp = sync_request_llm(self.cfg, history, tools=tools, generation_config=self.opts)
-        except BadRequestError as e:
-            if "auto" in str(e) and "tool choice" in str(e):
-                # Retry with tool_choice disabled for servers that don't support auto choice
-                opts_no_tool = self.opts.copy()
-                opts_no_tool.extra_body = {**(opts_no_tool.extra_body or {}), "tool_choice": "none", "enable_reasoning": False}
-                comp = sync_request_llm(self.cfg, history, tools=tools, generation_config=opts_no_tool)
-            else:
-                raise
-        msg = comp.choices[0].message
-        content = _get_msg_content(msg)
-
-        tool_call: Optional[ToolCalling] = None
-        if msg.tool_calls:
-            tc = msg.tool_calls[0]
-            try:
-                tool_call = ToolCalling(name=tc.function.name, arguments=json.loads(tc.function.arguments))
-            except Exception:
-                # fallback – malformed JSON or missing args
-                tool_call = ToolCalling(name=tc.function.name, arguments={})
-
-        return content or "", tool_call
+        new_msgs: list[dict] = []
+        for batch in self.bot.run(messages=history):
+            new_msgs = batch  # the library streams; each `batch` is list of new messages
+        return new_msgs
 
 
 # ---------------------------------------------------------------------------
@@ -231,8 +232,8 @@ class TrajectoryCollector:
         generation).  Providing it allows the agent to see argument structure and
         increases the chance it will emit correct function calls.
         """
-        self.human = SimulatedHuman(human_cfg)
-        self.agent = TestAgent(agent_cfg)
+        self.human = SimulatedHuman(human_cfg, debug=debug)
+        self.agent = QwenTestAgent(agent_cfg)
         self.tools_schema = tools_schema or {}
         self.debug = debug
 
@@ -255,7 +256,48 @@ class TrajectoryCollector:
                 break
 
             # 2) agent responds (may include tool call)
-            messages_for_agent = [{"role": t.role, "content": t.content} for t in history]
+            # ⚠️  The first turn in `history` is an internal system prompt that
+            # embeds the *full intent* so the SimulatedHuman can generate
+            # appropriate messages.  The agent MUST **not** see this –
+            # otherwise it trivially solves the task.  We therefore strip all
+            # system messages before forwarding the conversation to the agent.
+
+            # Translate internal Turn records to OpenAI/Qwen message schema
+            messages_for_agent: List[dict] = []
+            last_fc_name: Optional[str] = None
+            for t in history:
+                if t.role == "system":
+                    continue  # hide intent
+                if t.role == "function_call":
+                    try:
+                        fc_payload = json.loads(t.content)
+                    except Exception:
+                        continue  # malformed, skip
+                    last_fc_name = fc_payload.get("name")
+                    # Qwen-Agent expects arguments as **string**
+                    args_str = fc_payload.get("arguments")
+                    if isinstance(args_str, dict):
+                        args_str = json.dumps(args_str, ensure_ascii=False)
+                    assistant_fc = {
+                        "name": fc_payload.get("name"),
+                        "arguments": args_str,
+                    }
+                    messages_for_agent.append({
+                        "role": "assistant",
+                        "function_call": assistant_fc,
+                        "content": ""  # per spec, content must be empty or omitted when using function_call
+                    })
+                elif t.role == "observation":
+                    if last_fc_name is None:
+                        continue  # cannot pair; skip
+                    messages_for_agent.append({
+                        "role": "function",
+                        "name": last_fc_name,
+                        "content": t.content,
+                    })
+                    last_fc_name = None  # reset pairing
+                else:
+                    messages_for_agent.append({"role": t.role, "content": t.content})
 
             # Build tools list for this turn
             tools_schema_list: List[dict] = []
@@ -289,22 +331,41 @@ class TrajectoryCollector:
                         }
                     )
 
-            agent_text, call = self.agent.respond(messages_for_agent, tools=tools_schema_list)
-            history.append(Turn("assistant", agent_text))
-            if self.debug:
-                print("[ASSISTANT]", agent_text)
-            if call:
-                tool_calls.append(call)
-                if self.debug:
-                    print("   ↳ tool_call", call.model_dump())
+            new_msgs = self.agent.respond(messages_for_agent)
 
-            # simple success check: if agent text contains any expected output string we break
-            if any(out in agent_text for out in blueprint.expected_outputs):
-                history.append(Turn("user", "###STOP###"))
-                break
+            for m in new_msgs:
+                role = m.get("role")
+                if role == "assistant" and "function_call" in m:
+                    fc = m["function_call"]
+                    # `function_call.arguments` might come as *string* (JSON) per
+                    # OpenAI spec.  Convert to dict so ToolCalling passes
+                    # Pydantic validation.
+                    raw_args = fc.get("arguments", {})
+                    if isinstance(raw_args, str):
+                        try:
+                            raw_args = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            # leave as-is; validator will flag it later
+                            pass
 
-            # If we've observed all required tool calls we can finish early
-            if sorted(c.name for c in tool_calls) == sorted(a.name for a in blueprint.actions):
+                    val = json.dumps({"name": fc.get("name"), "arguments": json.dumps(raw_args, ensure_ascii=False)}, ensure_ascii=False)
+                    history.append(Turn("function_call", val))
+                    tool_calls.append(ToolCalling(name=fc.get("name"), arguments=raw_args))
+                    if self.debug:
+                        print("[FUNC_CALL]", val)
+                elif role == "function":
+                    history.append(Turn("observation", m.get("content", "")))
+                    if self.debug:
+                        print("[OBSERV]", m.get("content", ""))
+                else:
+                    # standard assistant message
+                    content = m.get("content", "")
+                    history.append(Turn("assistant", content))
+                    if self.debug:
+                        print("[ASSISTANT]", content)
+
+            # success check: all expected outputs present in assistant messages
+            if any(isinstance(t.content, str) and any(o in t.content for o in blueprint.expected_outputs) for t in history if t.role == "assistant"):
                 history.append(Turn("user", "###STOP###"))
                 break
 
@@ -349,34 +410,5 @@ def _get_msg_content(msg) -> str:  # type: ignore[Any]
     with "First message:").  We strip everything except the final answer so the
     rest of the pipeline sees just the conversational text.
     """
-    # 1) normal OpenAI behaviour
     content = getattr(msg, "content", None)
-    if content and content.strip():
-        return content.strip()
-
-    # 2) vLLM reasoning mode – clean it up
-    raw = getattr(msg, "reasoning_content", "").strip()
-    if not raw:
-        return ""
-
-    import re, textwrap
-
-    # Split into paragraphs delimited by blank lines
-    paragraphs = re.split(r"\n\s*\n", raw)
-
-    # Look from the end for a marker like "First message:" / "Next message:" / "Message:"
-    marker_regex = re.compile(r"(?:first|next)?\s*message:\s*(.*)$", re.I | re.S)
-    for para in reversed(paragraphs):
-        m = marker_regex.search(para.strip())
-        if m:
-            candidate = m.group(1).strip()
-            if candidate:
-                return textwrap.dedent(candidate).strip()
-
-    # Otherwise just return the last non-empty paragraph
-    for para in reversed(paragraphs):
-        if para.strip():
-            return para.strip()
-
-    # Fallback: raw text
-    return raw 
+    return content.strip() if isinstance(content, str) else "" 
