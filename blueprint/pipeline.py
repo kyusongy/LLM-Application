@@ -387,7 +387,7 @@ def generate_valid_blueprint(
     # High-creativity settings for the generator
     generator_opts = LLMGenerationOptions(temperature=1.0, max_tokens=2048, timeout=120, debug=True)
     # Low-creativity, deterministic settings for the judge
-    committee_opts = LLMGenerationOptions(temperature=0.0, max_tokens=2048, timeout=120, debug=True)
+    committee_opts = LLMGenerationOptions(temperature=0.1, max_tokens=2048, timeout=120, debug=True)
 
     generator = BlueprintGenerator(llm_cfg, gen_opts=generator_opts)
     validator = BlueprintValidator(tools_schema)

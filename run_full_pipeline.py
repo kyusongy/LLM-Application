@@ -79,6 +79,10 @@ To fulfil this we must:
   "intent": "You are Yusuf Rossi in 19122. You received your order #W2378156 and wish to exchange the mechanical keyboard for a similar one but with clicky switches and the smart thermostat for one compatible with Google Home instead of Apple HomeKit. If there is no keyboard that is clicky, RGB backlight, full size, you'd go for no backlight. You are detail-oriented and want to make sure everything is addressed in one go.",
   "actions": [
     {
+      "name": "find_user_id_by_name_zip",
+      "arguments": {"first_name": "Yusuf", "last_name": "Rossi", "zip": "19122"}
+    },
+    {
       "name": "get_order_details",
       "arguments": {"order_id": "#W2378156"}
     },
@@ -120,7 +124,7 @@ blueprint = generate_valid_blueprint(
         "sampled_user_details": SAMPLED_USER_DETAILS,
         "sampled_orders": SAMPLED_ORDERS,
         "examples": EXAMPLE_TASK,
-        "task_rules": "Delivered orders cannot be canceled.",
+        "task_rules": "",
     },
 )
 
